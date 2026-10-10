@@ -1,20 +1,21 @@
+# Migration replaces the existing high-pedaller_high-pedaller-web service in place.
+# Never deploy this file with a different stack name.
 services:
-  game:
-    image: ${IMAGE:?set immutable image reference}
+  high-pedaller-web:
+    image: ${IMAGE:?set immutable GHCR image reference}
     networks: [edge]
     environment:
-      - NODE_ENV=production
-      - ALLOWED_ORIGIN=https://${GAME_DOMAIN:?set domain}
-      - MAX_CONNECTIONS=100
+      NODE_ENV: production
+      PORT: "8080"
+      ALLOWED_ORIGIN: https://${GAME_DOMAIN:?set domain}
+      MAX_CONNECTIONS: "100"
     deploy:
-      replicas: 1
-      placement:
-        constraints: [node.role == worker]
+      replicas: 1 # In-memory matchmaking must not be split across replicas
       update_config:
         parallelism: 1
         order: stop-first
         failure_action: rollback
-        monitor: 45s
+        monitor: 60s
       rollback_config:
         parallelism: 1
         order: stop-first
@@ -27,10 +28,11 @@ services:
       labels:
         - traefik.enable=true
         - traefik.docker.network=${TRAEFIK_NETWORK:?set overlay network}
-        - traefik.http.routers.highpedaller.rule=Host(`${GAME_DOMAIN}`)
-        - traefik.http.routers.highpedaller.entrypoints=websecure
-        - traefik.http.routers.highpedaller.tls=true
-        - traefik.http.services.highpedaller.loadbalancer.server.port=8080
+        - traefik.http.routers.highracer.rule=Host(`${GAME_DOMAIN}`)
+        - traefik.http.routers.highracer.entrypoints=websecure
+        - traefik.http.routers.highracer.tls=true
+        - traefik.http.routers.highracer.service=highracer
+        - traefik.http.services.highracer.loadbalancer.server.port=8080
 networks:
   edge:
     external: true

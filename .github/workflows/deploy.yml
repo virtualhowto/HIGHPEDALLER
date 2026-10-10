@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       image_sha:
-        description: Tested full 40-character main branch commit SHA
+        description: Full 40-character SHA from published main branch image
         required: true
         type: string
 permissions:
@@ -19,21 +19,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Preflight
-        env:
-          IMAGE_SHA: ${{ inputs.image_sha }}
-          GAME_DOMAIN: ${{ vars.GAME_DOMAIN }}
-          TRAEFIK_NETWORK: ${{ vars.TRAEFIK_NETWORK }}
-        run: |
-          set -euo pipefail
-          [[ "$IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test -n "$GAME_DOMAIN"
-          test -n "$TRAEFIK_NETWORK"
-          docker info --format '{{.Swarm.ControlAvailable}}' | grep -qx true
-          docker network inspect "$TRAEFIK_NETWORK" >/dev/null
-          git fetch origin main
-          git merge-base --is-ancestor "$IMAGE_SHA" origin/main
-      - name: Deploy and validate
+      - name: Validate target, image and Swarm
         env:
           IMAGE_SHA: ${{ inputs.image_sha }}
           GAME_DOMAIN: ${{ vars.GAME_DOMAIN }}
@@ -42,18 +28,48 @@ jobs:
           REGISTRY_USER: ${{ github.actor }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/virtualhowto/highpedaller:$IMAGE_SHA"
+          [[ "$IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GAME_DOMAIN" == "highracer.virtualhowto.com" ]]
+          [[ "$TRAEFIK_NETWORK" == "t3_swarm" ]]
+          [[ "$(docker info --format '{{.Swarm.ControlAvailable}}')" == true ]]
+          docker network inspect "$TRAEFIK_NETWORK" --format '{{.Scope}} {{.Driver}}' | grep -qx 'swarm overlay'
+          git fetch origin main
+          git merge-base --is-ancestor "$IMAGE_SHA" origin/main
+          docker service inspect high-pedaller_high-pedaller-web >/dev/null
+          # Fail instead of creating a parallel service/stack.
+          if docker service inspect highpedaller_game >/dev/null 2>&1; then
+            echo "Unexpected duplicate highpedaller_game service found" >&2
+            exit 1
+          fi
           echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
-          docker pull "$IMAGE"
-          export IMAGE GAME_DOMAIN TRAEFIK_NETWORK
+          docker pull "ghcr.io/virtualhowto/highpedaller:$IMAGE_SHA"
+          echo "Preflight OK: existing stack and target image present"
+      - name: Update existing stack and verify HTTP + WebSocket routing
+        env:
+          IMAGE_SHA: ${{ inputs.image_sha }}
+          GAME_DOMAIN: ${{ vars.GAME_DOMAIN }}
+          TRAEFIK_NETWORK: ${{ vars.TRAEFIK_NETWORK }}
+        run: |
+          set -euo pipefail
+          export IMAGE="ghcr.io/virtualhowto/highpedaller:$IMAGE_SHA"
+          export GAME_DOMAIN TRAEFIK_NETWORK
           docker stack config -c deploy/stack.yml >/dev/null
-          docker stack deploy --with-registry-auth -c deploy/stack.yml highpedaller
+          # Existing service name remains high-pedaller_high-pedaller-web.
+          docker stack deploy --with-registry-auth -c deploy/stack.yml high-pedaller
           for i in $(seq 1 40); do
-            running=$(docker service ps highpedaller_game --filter desired-state=running --format '{{.CurrentState}}' | grep -c '^Running' || true)
-            if [[ "$running" == "1" ]]; then
-              if curl -fsS --max-time 8 "https://$GAME_DOMAIN/readyz" >/dev/null; then exit 0; fi
+            status="$(docker service inspect high-pedaller_high-pedaller-web --format '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{else}}unknown{{end}}')"
+            if [[ "$status" == "paused" || "$status" == "rollback_paused" ]]; then
+              echo "Swarm rollout failed: $status" >&2
+              break
+            fi
+            running="$(docker service ls --filter name=high-pedaller_high-pedaller-web --format '{{.Replicas}}' | head -1)"
+            if [[ "$running" == "1/1" ]] && curl -fsS --max-time 8 "https://$GAME_DOMAIN/readyz" >/dev/null; then
+              echo "Health check passed for $GAME_DOMAIN"
+              exit 0
             fi
             sleep 5
           done
-          echo "Post-deployment health validation failed; deployment requires investigation and potential rollback" >&2
+          docker service ps high-pedaller_high-pedaller-web --no-trunc || true
+          docker service update --rollback high-pedaller_high-pedaller-web || true
+          echo "Deployment did not become healthy; attempted rollback" >&2
           exit 1
