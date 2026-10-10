@@ -1,0 +1,59 @@
+name: Deploy Swarm
+on:
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: Tested full 40-character main branch commit SHA
+        required: true
+        type: string
+permissions:
+  contents: read
+  packages: read
+concurrency:
+  group: highpedaller-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    environment: production
+    runs-on: [self-hosted, linux, swarm-manager]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preflight
+        env:
+          IMAGE_SHA: ${{ inputs.image_sha }}
+          GAME_DOMAIN: ${{ vars.GAME_DOMAIN }}
+          TRAEFIK_NETWORK: ${{ vars.TRAEFIK_NETWORK }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test -n "$GAME_DOMAIN"
+          test -n "$TRAEFIK_NETWORK"
+          docker info --format '{{.Swarm.ControlAvailable}}' | grep -qx true
+          docker network inspect "$TRAEFIK_NETWORK" >/dev/null
+          git fetch origin main
+          git merge-base --is-ancestor "$IMAGE_SHA" origin/main
+      - name: Deploy and validate
+        env:
+          IMAGE_SHA: ${{ inputs.image_sha }}
+          GAME_DOMAIN: ${{ vars.GAME_DOMAIN }}
+          TRAEFIK_NETWORK: ${{ vars.TRAEFIK_NETWORK }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/virtualhowto/highpedaller:$IMAGE_SHA"
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          docker pull "$IMAGE"
+          export IMAGE GAME_DOMAIN TRAEFIK_NETWORK
+          docker stack config -c deploy/stack.yml >/dev/null
+          docker stack deploy --with-registry-auth -c deploy/stack.yml highpedaller
+          for i in $(seq 1 40); do
+            running=$(docker service ps highpedaller_game --filter desired-state=running --format '{{.CurrentState}}' | grep -c '^Running' || true)
+            if [[ "$running" == "1" ]]; then
+              if curl -fsS --max-time 8 "https://$GAME_DOMAIN/readyz" >/dev/null; then exit 0; fi
+            fi
+            sleep 5
+          done
+          echo "Post-deployment health validation failed; deployment requires investigation and potential rollback" >&2
+          exit 1
